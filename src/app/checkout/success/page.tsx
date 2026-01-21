@@ -1,8 +1,8 @@
+// src/app/checkout/success/page.tsx
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
-import Image from 'next/image';
+import { Suspense, useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
 import supabase from '@/lib/supabaseClient';
 
@@ -11,9 +11,8 @@ const gbp = new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP' 
 type OrderRow = {
   id: string;
   created_at: string;
-  amount_cents: number | null;
   currency: string | null;
-  stripe_session_id: string | null;
+  amount_cents: number | null;
   first_name: string | null;
   last_name: string | null;
   phone: string | null;
@@ -23,9 +22,10 @@ type OrderRow = {
   state: string | null;
   postal_code: string | null;
   country: string | null;
+  stripe_session_id: string | null;
 };
 
-type ItemRow = {
+type OrderItemRow = {
   id: string;
   order_id: string;
   title: string;
@@ -35,22 +35,24 @@ type ItemRow = {
   product_slug: string | null;
 };
 
-export default function SuccessPage() {
+function SuccessInner() {
   const sp = useSearchParams();
   const sid = sp.get('sid');
 
   const [loading, setLoading] = useState(true);
   const [order, setOrder] = useState<OrderRow | null>(null);
-  const [items, setItems] = useState<ItemRow[]>([]);
+  const [items, setItems] = useState<OrderItemRow[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const fullName = useMemo(() => {
-    if (!order) return '';
-    return `${order.first_name ?? ''} ${order.last_name ?? ''}`.trim();
+    const fn = order?.first_name ?? '';
+    const ln = order?.last_name ?? '';
+    const name = `${fn} ${ln}`.trim();
+    return name || null;
   }, [order]);
 
   const addressLine = useMemo(() => {
-    if (!order) return '';
+    if (!order) return null;
     const parts = [
       order.address_line1,
       order.address_line2,
@@ -59,7 +61,7 @@ export default function SuccessPage() {
       order.postal_code,
       order.country,
     ].filter(Boolean);
-    return parts.join(', ');
+    return parts.length ? parts.join(', ') : null;
   }, [order]);
 
   useEffect(() => {
@@ -71,20 +73,19 @@ export default function SuccessPage() {
 
       try {
         if (!sid) {
-          setError('Missing checkout session id.');
+          setLoading(false);
           return;
         }
 
-        // 1) fetch order by stripe_session_id
-        const { data: orderRow, error: oErr } = await supabase
+        // 1) Fetch order by stripe_session_id
+        const { data: orderData, error: orderErr } = await supabase
           .from('orders')
           .select(
             `
             id,
             created_at,
-            amount_cents,
             currency,
-            stripe_session_id,
+            amount_cents,
             first_name,
             last_name,
             phone,
@@ -93,33 +94,47 @@ export default function SuccessPage() {
             city,
             state,
             postal_code,
-            country
+            country,
+            stripe_session_id
           `
           )
           .eq('stripe_session_id', sid)
           .maybeSingle();
 
-        if (oErr) throw oErr;
-        if (!orderRow) {
-          setError('Order not found yet. If you just paid, refresh in a moment.');
-          return;
+        if (orderErr) throw orderErr;
+
+        if (!mounted) return;
+        setOrder(orderData as OrderRow | null);
+
+        // 2) Fetch items for that order (if found)
+        if (orderData?.id) {
+          const { data: itemsData, error: itemsErr } = await supabase
+            .from('order_items')
+            .select(
+              `
+              id,
+              order_id,
+              title,
+              qty,
+              price_cents,
+              image_url,
+              product_slug
+            `
+            )
+            .eq('order_id', orderData.id)
+            .order('created_at', { ascending: true });
+
+          if (itemsErr) throw itemsErr;
+
+          if (!mounted) return;
+          setItems((itemsData ?? []) as OrderItemRow[]);
+        } else {
+          setItems([]);
         }
-
-        // 2) fetch items for that order
-        const { data: itemRows, error: iErr } = await supabase
-          .from('order_items')
-          .select('id, order_id, title, qty, price_cents, image_url, product_slug')
-          .eq('order_id', orderRow.id)
-          .order('created_at', { ascending: true });
-
-        if (iErr) throw iErr;
-
-        if (!mounted) return;
-        setOrder(orderRow as OrderRow);
-        setItems((itemRows ?? []) as ItemRow[]);
       } catch (e: any) {
+        console.error('Success page load error:', e);
         if (!mounted) return;
-        setError(e?.message ?? 'Failed to load order.');
+        setError(e?.message ?? 'Failed to load order details.');
       } finally {
         if (!mounted) return;
         setLoading(false);
@@ -132,67 +147,95 @@ export default function SuccessPage() {
     };
   }, [sid]);
 
+  // Basic UI states
+  if (loading) {
+    return (
+      <main className="mx-auto max-w-3xl p-6">
+        <h1 className="text-2xl font-bold">Payment successful 🎉</h1>
+        <p className="mt-2 text-gray-600">Loading your order…</p>
+      </main>
+    );
+  }
+
+  if (error) {
+    return (
+      <main className="mx-auto max-w-3xl p-6">
+        <h1 className="text-2xl font-bold">Payment successful 🎉</h1>
+        <p className="mt-2 text-gray-600">Thanks for your order! We’ve recorded it.</p>
+        <p className="mt-3 text-sm text-red-600">Error loading details: {error}</p>
+        <Link href="/products" className="mt-6 inline-block rounded bg-black px-4 py-2 text-white">
+          Continue shopping
+        </Link>
+      </main>
+    );
+  }
+
+  // If we can’t find the order row (webhook delay / not inserted yet), show fallback
+  if (!order) {
+    return (
+      <main className="mx-auto max-w-3xl p-6">
+        <h1 className="text-2xl font-bold">Payment successful 🎉</h1>
+        <p className="mt-2 text-gray-600">Thanks for your order! We’ve recorded it.</p>
+
+        <div className="mt-4 rounded-lg border bg-white p-4 text-sm text-gray-700">
+          <div className="font-medium">Order confirmation is processing.</div>
+          <div className="text-gray-600">
+            If this page doesn’t update, check your <Link className="underline" href="/orders">Orders</Link> in a minute.
+          </div>
+        </div>
+
+        <Link href="/products" className="mt-6 inline-block rounded bg-black px-4 py-2 text-white">
+          Continue shopping
+        </Link>
+      </main>
+    );
+  }
+
+  // Show order summary
+  const total = gbp.format(((order.amount_cents ?? 0) / 100) || 0);
+
   return (
-    <main className="mx-auto max-w-3xl px-4 py-10">
+    <main className="mx-auto max-w-3xl p-6">
       <h1 className="text-3xl font-bold">Payment successful 🎉</h1>
-      <p className="mt-2 text-gray-700">Thanks for your order! We’ve recorded it.</p>
+      <p className="mt-2 text-gray-600">Thanks for your order! Here’s your receipt.</p>
 
-      {loading && <p className="mt-6">Loading order…</p>}
-      {error && <p className="mt-6 text-red-600">Error: {error}</p>}
+      <div className="mt-6 overflow-hidden rounded-xl border bg-white">
+        <div className="flex items-center justify-between border-b px-4 py-3 text-sm text-gray-600">
+          <div>
+            Order <code>{order.id.slice(0, 8)}…</code>
+          </div>
+          <div>{new Date(order.created_at).toLocaleString()}</div>
+        </div>
 
-      {!loading && !error && order && (
-        <div className="mt-6 overflow-hidden rounded-xl border bg-white">
-          <div className="flex items-start justify-between gap-4 border-b p-4">
-            <div>
-              <div className="text-sm text-gray-500">Order</div>
-              <div className="font-semibold">
-                <code>{order.id.slice(0, 8)}…</code>
-              </div>
-              <div className="mt-1 text-sm text-gray-500">
-                {new Date(order.created_at).toLocaleString()}
-              </div>
-            </div>
-
-            <div className="text-right">
-              <div className="text-sm text-gray-500">Total</div>
-              <div className="text-xl font-bold">
-                {gbp.format((order.amount_cents ?? 0) / 100)}
-              </div>
-            </div>
+        <div className="grid gap-4 border-b px-4 py-4 sm:grid-cols-2">
+          <div>
+            <div className="text-sm font-semibold">Ship to</div>
+            <div className="mt-1 text-sm text-gray-800">{fullName ?? '—'}</div>
+            {order.phone ? <div className="mt-1 text-sm text-gray-700">📞 {order.phone}</div> : null}
+            <div className="mt-1 text-sm text-gray-600">{addressLine ?? '—'}</div>
           </div>
 
-          <div className="grid gap-3 border-b p-4 sm:grid-cols-2">
-            <div>
-              <div className="font-semibold">Ship to</div>
-              <div className="text-sm text-gray-800">{fullName || '—'}</div>
-              {order.phone && <div className="text-sm text-gray-700">📞 {order.phone}</div>}
-              <div className="text-sm text-gray-600">{addressLine || '—'}</div>
-            </div>
-
-            <div className="sm:text-right">
-              <div className="font-semibold">What’s next</div>
-              <div className="text-sm text-gray-600">
-                You can track this order in your orders page.
-              </div>
-              <Link
-                href="/orders"
-                className="mt-2 inline-block rounded-md border px-3 py-2 text-sm font-semibold"
-              >
-                View my orders
-              </Link>
+          <div className="text-right">
+            <div className="text-sm text-gray-600">Order total</div>
+            <div className="text-2xl font-bold">{total}</div>
+            <div className="mt-1 text-xs text-gray-500">
+              Session: <code>{order.stripe_session_id?.slice(0, 10)}…</code>
             </div>
           </div>
+        </div>
 
-          <ul className="divide-y">
-            {items.map((it) => (
-              <li key={it.id} className="flex items-center gap-4 p-4">
-                <div className="relative h-14 w-14 overflow-hidden rounded bg-gray-100">
+        <ul className="divide-y">
+          {items.length === 0 ? (
+            <li className="px-4 py-4 text-sm text-gray-600">Items are still loading—check Orders shortly.</li>
+          ) : (
+            items.map((it) => (
+              <li key={it.id} className="flex items-center gap-4 px-4 py-3">
+                <div className="h-14 w-14 overflow-hidden rounded bg-gray-100">
                   {it.image_url ? (
-                    <Image src={it.image_url} alt={it.title} fill className="object-cover" />
+                    // Using normal img to avoid Next Image host issues on random URLs
+                    <img src={it.image_url} alt={it.title} className="h-full w-full object-cover" />
                   ) : (
-                    <div className="grid h-full w-full place-items-center text-xs text-gray-400">
-                      No image
-                    </div>
+                    <div className="grid h-full w-full place-items-center text-xs text-gray-400">No image</div>
                   )}
                 </div>
 
@@ -201,25 +244,41 @@ export default function SuccessPage() {
                   <div className="text-sm text-gray-600">
                     Qty: {it.qty} · Unit: {gbp.format((it.price_cents ?? 0) / 100)}
                   </div>
-                  {it.product_slug && (
-                    <div className="text-xs text-gray-500">slug: {it.product_slug}</div>
-                  )}
+                  {it.product_slug ? (
+                    <div className="text-xs text-gray-500">
+                      <Link className="underline" href={`/product/${it.product_slug}`}>
+                        View product
+                      </Link>
+                    </div>
+                  ) : null}
                 </div>
 
                 <div className="whitespace-nowrap font-semibold">
                   {gbp.format(((it.qty ?? 0) * (it.price_cents ?? 0)) / 100)}
                 </div>
               </li>
-            ))}
-          </ul>
-        </div>
-      )}
+            ))
+          )}
+        </ul>
+      </div>
 
-      <div className="mt-6">
-        <Link href="/products" className="inline-block rounded bg-black px-4 py-2 text-white">
+      <div className="mt-6 flex flex-wrap gap-3">
+        <Link href="/products" className="rounded bg-black px-4 py-2 text-white">
           Continue shopping
+        </Link>
+        <Link href="/orders" className="rounded border px-4 py-2">
+          View orders
         </Link>
       </div>
     </main>
+  );
+}
+
+export default function SuccessPage() {
+  // ✅ This fixes the build error by putting the hook inside Suspense
+  return (
+    <Suspense fallback={<main className="mx-auto max-w-3xl p-6">Loading…</main>}>
+      <SuccessInner />
+    </Suspense>
   );
 }
