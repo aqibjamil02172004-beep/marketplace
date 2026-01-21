@@ -4,8 +4,7 @@ import { useEffect, useMemo, useState } from 'react';
 import Image from 'next/image';
 import supabase from '@/lib/supabaseClient';
 
-export const dynamic = 'force-dynamic';
-export const revalidate = 0;
+
 
 const gbp = new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP' });
 
