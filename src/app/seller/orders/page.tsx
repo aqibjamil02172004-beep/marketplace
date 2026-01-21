@@ -1,8 +1,11 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import Image from 'next/image';
 import supabase from '@/lib/supabaseClient';
+
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
 
 const gbp = new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP' });
 
@@ -24,7 +27,7 @@ type JoinedOrder = {
 
 type ItemRow = {
   id: string;
-  created_at: string; // from order_items
+  created_at: string; // order_items.created_at
   order_id: string;
   seller_id: string | null;
   product_slug: string | null;
@@ -32,7 +35,7 @@ type ItemRow = {
   qty: number;
   price_cents: number;
   image_url: string | null;
-  orders?: JoinedOrder; // present when join succeeds
+  orders?: JoinedOrder; // join result
 };
 
 type OrderGroup = {
@@ -60,31 +63,50 @@ export default function SellerSalesPage() {
   const [items, setItems] = useState<ItemRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
   const [userId, setUserId] = useState<string | null>(null);
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError(null);
+  useEffect(() => {
+    let mounted = true;
 
-    try {
-      // 1) Who am I?
-      const { data: uRes, error: uErr } = await supabase.auth.getUser();
-      if (uErr) throw uErr;
+    async function load() {
+      if (!mounted) return;
 
-      const uid = uRes?.user?.id ?? null;
-      setUserId(uid);
+      setLoading(true);
+      setError(null);
 
-      if (!uid) {
-        setItems([]);
-        setError('Please sign in first.');
-        return;
-      }
+      // Safety timeout so the UI never stays stuck forever
+      const timeout = setTimeout(() => {
+        if (!mounted) return;
+        setLoading(false);
+        setError('Timed out loading sales. Please refresh.');
+      }, 12000);
 
-      // 2) Try single joined query first (fastest path)
-      const { data: joined, error: joinErr } = await supabase
-        .from('order_items')
-        .select(
-          `
+      try {
+        // 1) Wait for session to be ready
+        // (getSession is often more reliable immediately after refresh)
+        const { data: sRes, error: sErr } = await supabase.auth.getSession();
+        if (sErr) throw sErr;
+
+        const uid = sRes?.session?.user?.id ?? null;
+
+        if (!uid) {
+          // Not signed in (or session not restored yet)
+          // Don’t throw — just show friendly message.
+          setUserId(null);
+          setItems([]);
+          setLoading(false);
+          setError('Please sign in to view seller sales.');
+          return;
+        }
+
+        setUserId(uid);
+
+        // 2) Try JOIN query (best UX)
+        const { data: joined, error: joinErr } = await supabase
+          .from('order_items')
+          .select(
+            `
             id,
             created_at,
             order_id,
@@ -109,22 +131,25 @@ export default function SellerSalesPage() {
               country
             )
           `
-        )
-        .eq('seller_id', uid)
-        .order('created_at', { ascending: false });
+          )
+          .eq('seller_id', uid)
+          .order('created_at', { ascending: false });
 
-      if (!joinErr && Array.isArray(joined)) {
-        setItems(joined as unknown as ItemRow[]);
-        return;
-      }
+        if (!mounted) return;
 
-      // 3) Fallback (in case join is blocked by RLS or relationship issue)
-      console.warn('Join failed or blocked; using fallback. Details:', joinErr);
+        if (!joinErr && Array.isArray(joined)) {
+          setItems(joined as unknown as ItemRow[]);
+          setLoading(false);
+          return;
+        }
 
-      const { data: plainItems, error: itemsErr } = await supabase
-        .from('order_items')
-        .select(
-          `
+        // 3) Fallback path (if orders join blocked by RLS)
+        console.warn('Join blocked/failed; fallback path. Details:', joinErr?.message);
+
+        const { data: plainItems, error: itemsErr } = await supabase
+          .from('order_items')
+          .select(
+            `
             id,
             created_at,
             order_id,
@@ -135,20 +160,21 @@ export default function SellerSalesPage() {
             price_cents,
             image_url
           `
-        )
-        .eq('seller_id', uid)
-        .order('created_at', { ascending: false });
+          )
+          .eq('seller_id', uid)
+          .order('created_at', { ascending: false });
 
-      if (itemsErr) throw itemsErr;
+        if (itemsErr) throw itemsErr;
 
-      const orderIds = Array.from(new Set((plainItems ?? []).map((i) => i.order_id))).filter(Boolean);
-      let ordersById = new Map<string, JoinedOrder>();
+        // Try to fetch orders (may still be blocked by RLS for sellers)
+        const orderIds = Array.from(new Set((plainItems ?? []).map((i) => i.order_id)));
+        let ordersById = new Map<string, JoinedOrder>();
 
-      if (orderIds.length) {
-        const { data: ordersData, error: ordersErr } = await supabase
-          .from('orders')
-          .select(
-            `
+        if (orderIds.length) {
+          const { data: ordersData, error: ordersErr } = await supabase
+            .from('orders')
+            .select(
+              `
               id,
               created_at,
               amount_cents,
@@ -162,55 +188,50 @@ export default function SellerSalesPage() {
               postal_code,
               country
             `
-          )
-          .in('id', orderIds);
+            )
+            .in('id', orderIds);
 
-        if (!ordersErr && ordersData) {
-          ordersById = new Map(ordersData.map((o) => [o.id, o as JoinedOrder]));
-        } else {
-          console.warn('Orders fetch blocked/failed; showing items without shipping block.', ordersErr);
+          if (!ordersErr && ordersData) {
+            ordersById = new Map(ordersData.map((o) => [o.id, o as JoinedOrder]));
+          } else {
+            console.warn('Orders fetch blocked by RLS; items only. Details:', ordersErr?.message);
+          }
         }
+
+        const stitched = (plainItems ?? []).map((it) => ({
+          ...it,
+          orders: ordersById.get(it.order_id),
+        })) as ItemRow[];
+
+        setItems(stitched);
+        setLoading(false);
+      } catch (e: any) {
+        console.error('Seller sales load error:', e);
+        if (!mounted) return;
+        setLoading(false);
+        setError(e?.message ?? 'Failed to load sales.');
+      } finally {
+        clearTimeout(timeout);
       }
-
-      const stitched = (plainItems ?? []).map((it) => ({
-        ...it,
-        orders: ordersById.get(it.order_id),
-      })) as ItemRow[];
-
-      setItems(stitched);
-    } catch (e: any) {
-      console.error('Seller sales load error:', e);
-      setItems([]);
-      setError(e?.message ?? 'Failed to load sales.');
-    } finally {
-      setLoading(false);
     }
-  }, []);
 
-  useEffect(() => {
-    let mounted = true;
+    // Initial load
+    load();
 
-    const safeLoad = async () => {
-      if (!mounted) return;
-      await load();
-    };
-
-    safeLoad();
-
-    // ✅ Critical: refetch when auth/session changes
+    // ✅ Key fix: re-run load when auth changes (after refresh / token restore)
     const { data: sub } = supabase.auth.onAuthStateChange(() => {
-      safeLoad();
+      load();
     });
 
     return () => {
       mounted = false;
       sub.subscription.unsubscribe();
     };
-  }, [load]);
+  }, []);
 
-  // Group by order (only those where we have an orders row)
   const grouped: OrderGroup[] = useMemo(() => {
     const map = new Map<string, OrderGroup>();
+
     for (const it of items) {
       if (!it.orders) continue;
       const key = it.order_id;
@@ -218,43 +239,23 @@ export default function SellerSalesPage() {
       if (exist) exist.items.push(it);
       else map.set(key, { order: it.orders, items: [it] });
     }
+
     return Array.from(map.values()).sort(
       (a, b) => new Date(b.order.created_at).getTime() - new Date(a.order.created_at).getTime()
     );
   }, [items]);
 
-  const noOrdersVisible = useMemo(() => {
-    // items exist but none of them has joined order details
-    return items.length > 0 && grouped.length === 0 && items.every((x) => !x.orders);
-  }, [items, grouped]);
-
   if (loading) return <main className="p-6">Loading…</main>;
-  if (error)
-    return (
-      <main className="p-6">
-        <div className="rounded-lg border bg-white p-4">
-          <p className="text-red-600">Error: {error}</p>
-          <button onClick={load} className="mt-3 rounded bg-black px-3 py-2 text-sm text-white">
-            Try again
-          </button>
-        </div>
-      </main>
-    );
+  if (error) return <main className="p-6 text-red-600">Error: {error}</main>;
+
+  const noOrdersVisible = grouped.length === 0 && items.length > 0 && !items[0].orders;
 
   return (
     <main className="p-6">
-      <div className="mb-4 flex items-start justify-between gap-4">
-        <div>
-          <h1 className="mb-1 text-2xl font-bold">Seller hub — Sales</h1>
-          <p className="text-sm text-gray-500">
-            Seller: {userId ?? '—'} • Orders: {grouped.length}
-          </p>
-        </div>
-
-        <button onClick={load} className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50">
-          Refresh
-        </button>
-      </div>
+      <h1 className="mb-2 text-2xl font-bold">Seller hub — Sales</h1>
+      <p className="mb-6 text-sm text-gray-500">
+        Seller: {userId ?? '—'} • Orders: {grouped.length}
+      </p>
 
       {grouped.length === 0 && !noOrdersVisible && <p>No sales yet.</p>}
 
@@ -264,7 +265,7 @@ export default function SellerSalesPage() {
             const ship = formatShipTo(order);
 
             return (
-              <li key={order.id} className="overflow-hidden rounded-xl border bg-white">
+              <li key={order.id} className="overflow-hidden rounded-xl border">
                 <header className="flex items-center justify-between border-b px-4 py-3 text-sm text-gray-600">
                   <div>
                     Order <code>{order.id.slice(0, 8)}…</code>
@@ -272,11 +273,9 @@ export default function SellerSalesPage() {
                   <div>{new Date(order.created_at).toLocaleString()}</div>
                 </header>
 
-                {/* Ship-to block */}
                 <div className="grid gap-3 border-b px-4 py-3 sm:grid-cols-2">
                   <div>
                     <div className="font-semibold">Ship to</div>
-
                     <div className="text-sm text-gray-800">{ship.fullName}</div>
 
                     {ship.phone && (
@@ -287,7 +286,7 @@ export default function SellerSalesPage() {
                     )}
 
                     <div className="mt-1 text-sm text-gray-600">
-                      {ship.lines.length ? ship.lines.map((line, idx) => <div key={idx}>{line}</div>) : <div>—</div>}
+                      {ship.lines.length ? ship.lines.map((l, i) => <div key={i}>{l}</div>) : <div>—</div>}
                     </div>
                   </div>
 
@@ -297,7 +296,6 @@ export default function SellerSalesPage() {
                   </div>
                 </div>
 
-                {/* Items */}
                 <ul className="divide-y">
                   {itemsInOrder.map((it) => (
                     <li key={it.id} className="flex items-center gap-4 px-4 py-3">
@@ -329,14 +327,13 @@ export default function SellerSalesPage() {
         </ul>
       )}
 
-      {/* Fallback UI if orders are invisible due to RLS but items exist */}
       {noOrdersVisible && (
         <>
           <p className="mb-3 text-sm text-amber-700">
             Some order details are hidden by security policies. Showing item list only.
           </p>
 
-          <ul className="divide-y rounded-xl border bg-white">
+          <ul className="divide-y rounded-xl border">
             {items.map((it) => (
               <li key={it.id} className="flex items-center gap-4 px-4 py-3">
                 <div className="relative h-14 w-14 overflow-hidden rounded bg-gray-100">
