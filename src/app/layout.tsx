@@ -2,6 +2,7 @@
 import './globals.css';
 import Providers from './providers';
 import Header from './Header';
+import { Suspense } from "react";
 
 export const metadata = {
   title: 'Alvy',
@@ -13,7 +14,11 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en">
       <body className="bg-gray-50 text-gray-900">
         <Providers>
+          <Suspense fallback={null}>
+
           <Header />
+          </Suspense>
+
           <main className="min-h-screen">{children}</main>
         </Providers>
       </body>
