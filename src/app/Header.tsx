@@ -18,74 +18,75 @@ export default function Header() {
   const searchRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
+  const [authReady, setAuthReady] = useState(false);
   const [userEmail, setUserEmail] = useState<string | null>(null);
   const [initial, setInitial] = useState<string>('U');
   const [sellerStatus, setSellerStatus] = useState<SellerStatus>(null);
   const [menuOpen, setMenuOpen] = useState(false);
 
-  // --- Auth & seller status ---
+  function computeInitial(email: string | null, user: any) {
+    const fullName =
+      (user?.user_metadata as any)?.full_name ||
+      (user?.user_metadata as any)?.name ||
+      '';
+    const src = (fullName || email || '').trim();
+    return src ? src.charAt(0).toUpperCase() : 'U';
+  }
+
+  async function loadSellerStatus(uid: string) {
+    try {
+      const { data, error } = await supabase
+        .from('sellers')
+        .select('status')
+        .eq('id', uid) // sellers.id = auth.uid()
+        .maybeSingle();
+
+      if (error) return null;
+      return (data?.status as SellerStatus) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  // --- Auth & seller status (robust, works after Stripe redirect) ---
   useEffect(() => {
     let mounted = true;
 
-    async function load() {
-      const { data } = await supabase.auth.getUser();
-      const user = data.user;
+    async function init() {
+      const { data } = await supabase.auth.getSession();
       if (!mounted) return;
 
-      const email = user?.email ?? null;
+      const session = data.session ?? null;
+      const email = session?.user?.email ?? null;
+
       setUserEmail(email);
+      setInitial(computeInitial(email, session?.user));
+      setAuthReady(true);
 
-      const fullName =
-        (user?.user_metadata as any)?.full_name ||
-        (user?.user_metadata as any)?.name ||
-        '';
-      const sourceForInitial = (fullName || email || '').trim();
-      setInitial(sourceForInitial ? sourceForInitial.charAt(0).toUpperCase() : 'U');
-
-      // Try to read seller status (manual approval flow)
-      if (user) {
-        const { data: s, error } = await supabase
-          .from('sellers')
-          .select('status')
-          .eq('id', user.id) // assuming sellers.id = auth.uid
-          .maybeSingle();
-
+      if (session?.user?.id) {
+        const status = await loadSellerStatus(session.user.id);
         if (!mounted) return;
-        if (error || !s) setSellerStatus(null);
-        else setSellerStatus((s.status as SellerStatus) ?? null);
+        setSellerStatus(status);
       } else {
         setSellerStatus(null);
       }
     }
 
-    load();
-    const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => {
+    init();
+
+    const { data: sub } = supabase.auth.onAuthStateChange(async (_event, session) => {
       const email = session?.user?.email ?? null;
+
       setUserEmail(email);
-      const fullName =
-        (session?.user?.user_metadata as any)?.full_name ||
-        (session?.user?.user_metadata as any)?.name ||
-        '';
-      const src = (fullName || email || '').trim();
-      setInitial(src ? src.charAt(0).toUpperCase() : 'U');
-      setSellerStatus(null); // will re-check below
-      if (session?.user) {
-  (async () => {
-    try {
-      const { data } = await supabase
-        .from('sellers')
-        .select('status')
-        .eq('id', session.user.id)
-        .maybeSingle();
+      setInitial(computeInitial(email, session?.user));
+      setAuthReady(true);
 
-      setSellerStatus((data?.status as SellerStatus) ?? null);
-    } catch {
-      setSellerStatus(null);
-    }
-  })();
-}
-
-
+      if (session?.user?.id) {
+        const status = await loadSellerStatus(session.user.id);
+        setSellerStatus(status);
+      } else {
+        setSellerStatus(null);
+      }
     });
 
     return () => {
@@ -98,9 +99,7 @@ export default function Header() {
   useEffect(() => {
     function onClick(e: MouseEvent) {
       if (!menuRef.current) return;
-      if (!menuRef.current.contains(e.target as Node)) {
-        setMenuOpen(false);
-      }
+      if (!menuRef.current.contains(e.target as Node)) setMenuOpen(false);
     }
     function onKey(e: KeyboardEvent) {
       if (e.key === 'Escape') setMenuOpen(false);
@@ -127,6 +126,7 @@ export default function Header() {
   async function signOut() {
     await supabase.auth.signOut();
     setMenuOpen(false);
+    // Router refresh is enough; auth listener will also update state
     router.refresh();
   }
 
@@ -171,7 +171,7 @@ export default function Header() {
         </form>
 
         {/* Auth / Profile */}
-        {!userEmail ? (
+        {!authReady ? null : !userEmail ? (
           <Link
             href="/signin"
             className="hidden sm:inline-flex rounded-full border px-3 py-2 text-sm hover:bg-gray-50"
@@ -186,7 +186,6 @@ export default function Header() {
               aria-haspopup="menu"
               aria-expanded={menuOpen}
             >
-              {/* Initial only (no email text) */}
               <span className="flex h-8 w-8 items-center justify-center rounded-full bg-gray-900 text-sm font-semibold text-white">
                 {initial}
               </span>
@@ -199,7 +198,6 @@ export default function Header() {
               </svg>
             </button>
 
-            {/* Dropdown */}
             {menuOpen && (
               <div
                 role="menu"
@@ -213,6 +211,7 @@ export default function Header() {
                 >
                   Account
                 </Link>
+
                 <Link
                   href="/orders"
                   onClick={() => setMenuOpen(false)}
@@ -222,7 +221,6 @@ export default function Header() {
                   Orders
                 </Link>
 
-                {/* Sell: if approved → seller hub; else → apply */}
                 {sellerStatus === 'approved' ? (
                   <Link
                     href="/seller/products"
@@ -256,10 +254,7 @@ export default function Header() {
         )}
 
         {/* Cart */}
-        <Link
-          href="/cart"
-          className="relative rounded-full border px-3 py-2 hover:bg-gray-50"
-        >
+        <Link href="/cart" className="relative rounded-full border px-3 py-2 hover:bg-gray-50">
           Cart
           <span className="absolute -right-2 -top-2 inline-flex h-6 min-w-[1.5rem] items-center justify-center rounded-full bg-black px-1 text-xs font-semibold text-white">
             {count ?? 0}
