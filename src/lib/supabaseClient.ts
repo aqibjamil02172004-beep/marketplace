@@ -1,16 +1,14 @@
-// src/lib/supabaseClient.ts
-import { createClient as createSupabaseClient } from '@supabase/supabase-js';
+import { createClient } from "@supabase/supabase-js";
 
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
 
-// ✅ create a reusable singleton client
-const supabase = createSupabaseClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+  auth: {
+    persistSession: true,
+    autoRefreshToken: true,
+    detectSessionInUrl: true,
+  },
+});
 
-// ✅ default export (so `import supabase from ...` works)
 export default supabase;
-
-// ✅ named export for new code (so `createClient()` also works)
-export function createClient() {
-  return createSupabaseClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-}

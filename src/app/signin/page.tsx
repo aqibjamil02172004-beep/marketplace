@@ -1,28 +1,46 @@
 'use client';
 
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
-import { useState } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
+import { useMemo, useState } from 'react';
 import supabase from '@/lib/supabaseClient';
 
 export default function SignInPage() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const safeEmail = useMemo(() => email.trim().toLowerCase(), [email]);
+
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
-    setLoading(true);
-    const { error } = await supabase.auth.signInWithPassword({ email, password });
-    setLoading(false);
-    if (error) {
-      setError(error.message);
-      return;
+
+    try {
+      setLoading(true);
+
+      const { error } = await supabase.auth.signInWithPassword({
+        email: safeEmail,
+        password,
+      });
+
+      if (error) {
+        setError(error.message);
+        return;
+      }
+
+      // If you ever pass ?next=/somewhere, this will redirect there
+      const next = searchParams?.get('next') || '/';
+
+      router.push(next);
+      router.refresh(); // ✅ important: updates Header/orders without reload
+    } finally {
+      setLoading(false);
     }
-    router.push('/'); // back to home
   }
 
   return (
@@ -44,6 +62,7 @@ export default function SignInPage() {
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               className="w-full rounded-md border px-3 py-2 outline-none focus:ring-2 focus:ring-blue-500"
+              autoComplete="email"
             />
           </label>
 
@@ -55,6 +74,7 @@ export default function SignInPage() {
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               className="w-full rounded-md border px-3 py-2 outline-none focus:ring-2 focus:ring-blue-500"
+              autoComplete="current-password"
             />
           </label>
 

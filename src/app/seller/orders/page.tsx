@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import Image from 'next/image';
 import supabase from '@/lib/supabaseClient';
 
@@ -49,12 +49,9 @@ function formatShipTo(order: JoinedOrder) {
   const post = order.postal_code ?? '';
   const country = order.country ?? '';
 
-  const lines = [
-    line1,
-    line2,
-    [cityState, post].filter(Boolean).join(' ').trim(),
-    country,
-  ].filter((x) => x && x.trim().length > 0);
+  const lines = [line1, line2, [cityState, post].filter(Boolean).join(' ').trim(), country].filter(
+    (x) => x && x.trim().length > 0
+  );
 
   return { fullName, phone: order.phone ?? null, lines };
 }
@@ -65,30 +62,29 @@ export default function SellerSalesPage() {
   const [error, setError] = useState<string | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
 
-  useEffect(() => {
-    let mounted = true;
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
 
-    async function load() {
-      setLoading(true);
-      setError(null);
+    try {
+      // 1) Who am I?
+      const { data: uRes, error: uErr } = await supabase.auth.getUser();
+      if (uErr) throw uErr;
 
-      try {
-        // 1) Who am I?
-        const { data: uRes, error: uErr } = await supabase.auth.getUser();
-        if (uErr) throw uErr;
-        const uid = uRes?.user?.id ?? null;
+      const uid = uRes?.user?.id ?? null;
+      setUserId(uid);
 
-        if (!uid) {
-          if (mounted) setError('Please sign in first.');
-          return;
-        }
-        if (!mounted) return;
-        setUserId(uid);
+      if (!uid) {
+        setItems([]);
+        setError('Please sign in first.');
+        return;
+      }
 
-        // 2) Try single joined query first (fastest path)
-        const { data: joined, error: joinErr } = await supabase
-          .from('order_items')
-          .select(`
+      // 2) Try single joined query first (fastest path)
+      const { data: joined, error: joinErr } = await supabase
+        .from('order_items')
+        .select(
+          `
             id,
             created_at,
             order_id,
@@ -112,23 +108,23 @@ export default function SellerSalesPage() {
               postal_code,
               country
             )
-          `)
-          .eq('seller_id', uid)
-          .order('created_at', { ascending: false });
+          `
+        )
+        .eq('seller_id', uid)
+        .order('created_at', { ascending: false });
 
-        if (!mounted) return;
+      if (!joinErr && Array.isArray(joined)) {
+        setItems(joined as unknown as ItemRow[]);
+        return;
+      }
 
-        if (!joinErr && Array.isArray(joined)) {
-          setItems(joined as unknown as ItemRow[]);
-          return;
-        }
+      // 3) Fallback (in case join is blocked by RLS or relationship issue)
+      console.warn('Join failed or blocked; using fallback. Details:', joinErr);
 
-        // 3) Fallback (in case RLS on orders blocks the join)
-        console.warn('Join failed or blocked by RLS; using fallback. Details:', joinErr);
-
-        const { data: plainItems, error: itemsErr } = await supabase
-          .from('order_items')
-          .select(`
+      const { data: plainItems, error: itemsErr } = await supabase
+        .from('order_items')
+        .select(
+          `
             id,
             created_at,
             order_id,
@@ -138,19 +134,21 @@ export default function SellerSalesPage() {
             qty,
             price_cents,
             image_url
-          `)
-          .eq('seller_id', uid)
-          .order('created_at', { ascending: false });
+          `
+        )
+        .eq('seller_id', uid)
+        .order('created_at', { ascending: false });
 
-        if (itemsErr) throw itemsErr;
+      if (itemsErr) throw itemsErr;
 
-        const orderIds = Array.from(new Set((plainItems ?? []).map((i) => i.order_id)));
-        let ordersById = new Map<string, JoinedOrder>();
+      const orderIds = Array.from(new Set((plainItems ?? []).map((i) => i.order_id))).filter(Boolean);
+      let ordersById = new Map<string, JoinedOrder>();
 
-        if (orderIds.length) {
-          const { data: ordersData, error: ordersErr } = await supabase
-            .from('orders')
-            .select(`
+      if (orderIds.length) {
+        const { data: ordersData, error: ordersErr } = await supabase
+          .from('orders')
+          .select(
+            `
               id,
               created_at,
               amount_cents,
@@ -163,35 +161,52 @@ export default function SellerSalesPage() {
               state,
               postal_code,
               country
-            `)
-            .in('id', orderIds);
+            `
+          )
+          .in('id', orderIds);
 
-          if (!ordersErr && ordersData) {
-            ordersById = new Map(ordersData.map((o) => [o.id, o as JoinedOrder]));
-          } else {
-            console.warn('Orders fetch blocked or failed; showing items without shipping block.', ordersErr);
-          }
+        if (!ordersErr && ordersData) {
+          ordersById = new Map(ordersData.map((o) => [o.id, o as JoinedOrder]));
+        } else {
+          console.warn('Orders fetch blocked/failed; showing items without shipping block.', ordersErr);
         }
-
-        const stitched = (plainItems ?? []).map((it) => ({
-          ...it,
-          orders: ordersById.get(it.order_id),
-        })) as ItemRow[];
-
-        setItems(stitched);
-      } catch (e: any) {
-        console.error('Seller sales load error:', e);
-        if (mounted) setError(e?.message ?? 'Failed to load sales.');
-      } finally {
-        if (mounted) setLoading(false);
       }
-    }
 
-    load();
+      const stitched = (plainItems ?? []).map((it) => ({
+        ...it,
+        orders: ordersById.get(it.order_id),
+      })) as ItemRow[];
+
+      setItems(stitched);
+    } catch (e: any) {
+      console.error('Seller sales load error:', e);
+      setItems([]);
+      setError(e?.message ?? 'Failed to load sales.');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+
+    const safeLoad = async () => {
+      if (!mounted) return;
+      await load();
+    };
+
+    safeLoad();
+
+    // ✅ Critical: refetch when auth/session changes
+    const { data: sub } = supabase.auth.onAuthStateChange(() => {
+      safeLoad();
+    });
+
     return () => {
       mounted = false;
+      sub.subscription.unsubscribe();
     };
-  }, []);
+  }, [load]);
 
   // Group by order (only those where we have an orders row)
   const grouped: OrderGroup[] = useMemo(() => {
@@ -203,23 +218,43 @@ export default function SellerSalesPage() {
       if (exist) exist.items.push(it);
       else map.set(key, { order: it.orders, items: [it] });
     }
-
     return Array.from(map.values()).sort(
       (a, b) => new Date(b.order.created_at).getTime() - new Date(a.order.created_at).getTime()
     );
   }, [items]);
 
-  if (loading) return <main className="p-6">Loading…</main>;
-  if (error) return <main className="p-6 text-red-600">Error: {error}</main>;
+  const noOrdersVisible = useMemo(() => {
+    // items exist but none of them has joined order details
+    return items.length > 0 && grouped.length === 0 && items.every((x) => !x.orders);
+  }, [items, grouped]);
 
-  const noOrdersVisible = grouped.length === 0 && items.length > 0 && !items[0].orders;
+  if (loading) return <main className="p-6">Loading…</main>;
+  if (error)
+    return (
+      <main className="p-6">
+        <div className="rounded-lg border bg-white p-4">
+          <p className="text-red-600">Error: {error}</p>
+          <button onClick={load} className="mt-3 rounded bg-black px-3 py-2 text-sm text-white">
+            Try again
+          </button>
+        </div>
+      </main>
+    );
 
   return (
     <main className="p-6">
-      <h1 className="mb-2 text-2xl font-bold">Seller hub — Sales</h1>
-      <p className="mb-6 text-sm text-gray-500">
-        Seller: {userId ?? '—'} • Orders: {grouped.length}
-      </p>
+      <div className="mb-4 flex items-start justify-between gap-4">
+        <div>
+          <h1 className="mb-1 text-2xl font-bold">Seller hub — Sales</h1>
+          <p className="text-sm text-gray-500">
+            Seller: {userId ?? '—'} • Orders: {grouped.length}
+          </p>
+        </div>
+
+        <button onClick={load} className="rounded-md border px-3 py-2 text-sm hover:bg-gray-50">
+          Refresh
+        </button>
+      </div>
 
       {grouped.length === 0 && !noOrdersVisible && <p>No sales yet.</p>}
 
@@ -229,7 +264,7 @@ export default function SellerSalesPage() {
             const ship = formatShipTo(order);
 
             return (
-              <li key={order.id} className="overflow-hidden rounded-xl border">
+              <li key={order.id} className="overflow-hidden rounded-xl border bg-white">
                 <header className="flex items-center justify-between border-b px-4 py-3 text-sm text-gray-600">
                   <div>
                     Order <code>{order.id.slice(0, 8)}…</code>
@@ -252,19 +287,13 @@ export default function SellerSalesPage() {
                     )}
 
                     <div className="mt-1 text-sm text-gray-600">
-                      {ship.lines.length ? (
-                        ship.lines.map((line, idx) => <div key={idx}>{line}</div>)
-                      ) : (
-                        <div>—</div>
-                      )}
+                      {ship.lines.length ? ship.lines.map((line, idx) => <div key={idx}>{line}</div>) : <div>—</div>}
                     </div>
                   </div>
 
                   <div className="text-right text-sm text-gray-700">
                     Order total:{' '}
-                    <span className="font-semibold">
-                      {gbp.format((order.amount_cents ?? 0) / 100)}
-                    </span>
+                    <span className="font-semibold">{gbp.format((order.amount_cents ?? 0) / 100)}</span>
                   </div>
                 </div>
 
@@ -276,9 +305,7 @@ export default function SellerSalesPage() {
                         {it.image_url ? (
                           <Image src={it.image_url} alt={it.title} fill className="object-cover" />
                         ) : (
-                          <div className="grid h-full w-full place-items-center text-xs text-gray-400">
-                            No image
-                          </div>
+                          <div className="grid h-full w-full place-items-center text-xs text-gray-400">No image</div>
                         )}
                       </div>
 
@@ -287,9 +314,7 @@ export default function SellerSalesPage() {
                         <div className="text-sm text-gray-600">
                           Qty: {it.qty} · Unit: {gbp.format((it.price_cents ?? 0) / 100)}
                         </div>
-                        {it.product_slug && (
-                          <div className="text-xs text-gray-500">slug: {it.product_slug}</div>
-                        )}
+                        {it.product_slug && <div className="text-xs text-gray-500">slug: {it.product_slug}</div>}
                       </div>
 
                       <div className="whitespace-nowrap font-semibold">
@@ -311,16 +336,14 @@ export default function SellerSalesPage() {
             Some order details are hidden by security policies. Showing item list only.
           </p>
 
-          <ul className="divide-y rounded-xl border">
+          <ul className="divide-y rounded-xl border bg-white">
             {items.map((it) => (
               <li key={it.id} className="flex items-center gap-4 px-4 py-3">
                 <div className="relative h-14 w-14 overflow-hidden rounded bg-gray-100">
                   {it.image_url ? (
                     <Image src={it.image_url} alt={it.title} fill className="object-cover" />
                   ) : (
-                    <div className="grid h-full w-full place-items-center text-xs text-gray-400">
-                      No image
-                    </div>
+                    <div className="grid h-full w-full place-items-center text-xs text-gray-400">No image</div>
                   )}
                 </div>
 
@@ -334,9 +357,7 @@ export default function SellerSalesPage() {
 
                 <div className="text-right">
                   <div className="text-xs text-gray-500">Order {it.order_id.slice(0, 8)}…</div>
-                  <div className="font-semibold">
-                    {gbp.format(((it.qty ?? 0) * (it.price_cents ?? 0)) / 100)}
-                  </div>
+                  <div className="font-semibold">{gbp.format(((it.qty ?? 0) * (it.price_cents ?? 0)) / 100)}</div>
                 </div>
               </li>
             ))}

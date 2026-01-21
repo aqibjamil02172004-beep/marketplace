@@ -1,12 +1,15 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import supabase from "@/lib/supabaseClient";
 
 type Mode = "signin" | "signup";
 type Step = "form" | "verify";
 
 export default function AuthForm() {
+  const router = useRouter();
+
   const [mode, setMode] = useState<Mode>("signin");
   const [step, setStep] = useState<Step>("form");
 
@@ -32,6 +35,7 @@ export default function AuthForm() {
           email: safeEmail,
           password,
           options: {
+            // not used for OTP itself, but fine to keep for fallback flows
             emailRedirectTo: `${window.location.origin}/signin`,
           },
         });
@@ -40,14 +44,19 @@ export default function AuthForm() {
         setStep("verify");
         setMsg(`We sent a verification code to ${safeEmail}.`);
       } else {
-        const { error } = await supabase.auth.signInWithPassword({ email: safeEmail, password });
+        const { error } = await supabase.auth.signInWithPassword({
+          email: safeEmail,
+          password,
+        });
         if (error) throw error;
 
         setMsg("Signed in!");
-        location.reload();
+        // ✅ no reload — refresh Next.js and navigate
+        router.push("/");
+        router.refresh();
       }
     } catch (err: any) {
-      setMsg(err.message);
+      setMsg(err?.message ?? "Something went wrong");
     } finally {
       setLoading(false);
     }
@@ -71,17 +80,20 @@ export default function AuthForm() {
 
       if (error) throw error;
 
+      // Supabase often returns a session immediately after verify
       if (data?.session) {
         setMsg("Verified & signed in!");
-        location.reload();
+        router.push("/");
+        router.refresh();
       } else {
+        // If no session came back, user may still need to sign in
         setMsg("Verified! Now sign in.");
         setMode("signin");
         setStep("form");
         setOtp("");
       }
     } catch (err: any) {
-      setMsg(err.message);
+      setMsg(err?.message ?? "Verification failed");
     } finally {
       setLoading(false);
     }
@@ -91,19 +103,29 @@ export default function AuthForm() {
     setMsg(null);
     try {
       setLoading(true);
-      const { error } = await supabase.auth.resend({ type: "signup", email: safeEmail });
+      const { error } = await supabase.auth.resend({
+        type: "signup",
+        email: safeEmail,
+      });
       if (error) throw error;
       setMsg(`New code sent to ${safeEmail}.`);
     } catch (err: any) {
-      setMsg(err.message);
+      setMsg(err?.message ?? "Could not resend code");
     } finally {
       setLoading(false);
     }
   }
 
   async function signOut() {
-    await supabase.auth.signOut();
-    location.reload();
+    setMsg(null);
+    try {
+      setLoading(true);
+      await supabase.auth.signOut();
+      router.push("/");
+      router.refresh();
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (
@@ -111,6 +133,7 @@ export default function AuthForm() {
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-semibold">Account</h2>
         <button
+          type="button"
           onClick={() => {
             setMode(mode === "signin" ? "signup" : "signin");
             setStep("form");
@@ -140,6 +163,7 @@ export default function AuthForm() {
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             required
+            minLength={6}
           />
           <button disabled={loading} className="rounded bg-black px-3 py-2 text-white disabled:opacity-60">
             {loading ? "Please wait…" : mode === "signin" ? "Sign in" : "Sign up"}
@@ -174,7 +198,7 @@ export default function AuthForm() {
 
       {msg && <p className="mt-2 text-sm">{msg}</p>}
 
-      <button onClick={signOut} className="mt-3 text-sm underline">
+      <button onClick={signOut} className="mt-3 text-sm underline disabled:opacity-60" disabled={loading}>
         Sign out
       </button>
     </div>

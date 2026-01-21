@@ -1,7 +1,8 @@
 // src/app/products/ProductsGrid.tsx
 import Image from 'next/image';
 import Link from 'next/link';
-import { createClient } from '@/lib/supabaseClient';
+import supabase from "@/lib/supabaseClient";
+
 
 type Props = {
   q?: string;
@@ -29,7 +30,7 @@ function firstImageOf(p: ProductRow): string {
 }
 
 export default async function ProductsGrid({ q = '', limit }: Props) {
-  const supabase = createClient();
+  
 
   // Build query
   let query = supabase

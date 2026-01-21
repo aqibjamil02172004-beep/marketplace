@@ -2,7 +2,8 @@ import ImageGallery from "./ImageGallery";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import ProductClient from "./ProductClient";
-import { createClient } from "@/lib/supabaseClient";
+import supabase from "@/lib/supabaseClient";
+
 
 /* ------------------------------- Types ------------------------------- */
 export type ProductRow = {
@@ -20,7 +21,7 @@ export type ProductRow = {
 
 /* ----------------------------- Data Fetch ---------------------------- */
 async function getProduct(slug: string): Promise<ProductRow | null> {
-  const supabase = createClient();
+ 
 
   const { data, error } = await supabase
     .from("products")
