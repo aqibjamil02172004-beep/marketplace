@@ -29,7 +29,6 @@ function withTimeout<T>(promiseLike: PromiseLike<T>, ms: number, message = 'Requ
     timer = setTimeout(() => reject(new Error(message)), ms);
   });
 
-  // ✅ Promise.resolve converts PromiseLike into a real Promise for Promise.race
   return Promise.race([Promise.resolve(promiseLike), timeoutPromise]).finally(() => {
     if (timer) clearTimeout(timer);
   }) as Promise<T>;
@@ -37,6 +36,48 @@ function withTimeout<T>(promiseLike: PromiseLike<T>, ms: number, message = 'Requ
 
 function isExternalUrl(url: string) {
   return /^https?:\/\//i.test(url);
+}
+
+/**
+ * Reads the supabase auth token stored in localStorage.
+ * Your console output shows it is stored as a JSON string containing access_token + refresh_token.
+ */
+function getStoredTokens(): { access_token: string; refresh_token: string } | null {
+  try {
+    const key = Object.keys(localStorage).find((k) => k.includes('auth-token'));
+    if (!key) return null;
+
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+
+    const parsed = JSON.parse(raw);
+
+    const access_token =
+      parsed?.access_token ?? parsed?.currentSession?.access_token ?? parsed?.session?.access_token;
+    const refresh_token =
+      parsed?.refresh_token ?? parsed?.currentSession?.refresh_token ?? parsed?.session?.refresh_token;
+
+    if (!access_token || !refresh_token) return null;
+
+    return { access_token, refresh_token };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Production fix: if Supabase gets into a stuck state on refresh,
+ * force rehydrate the session from localStorage before calling getSession().
+ */
+async function forceRestoreSession() {
+  const tokens = getStoredTokens();
+  if (!tokens) return;
+
+  try {
+    await withTimeout(supabase.auth.setSession(tokens), 8000, 'Session rehydrate timed out');
+  } catch {
+    // ignore; caller will handle if session still can't be read
+  }
 }
 
 export default function OrdersPage() {
@@ -63,6 +104,9 @@ export default function OrdersPage() {
     setError(null);
 
     try {
+      // ✅ IMPORTANT: force restore before getSession (fixes prod refresh timeouts)
+      await forceRestoreSession();
+
       // 1) Session
       const sessionRes = await withTimeout(supabase.auth.getSession(), 8000, 'Session lookup timed out');
 
