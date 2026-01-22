@@ -1,10 +1,27 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import Image from 'next/image';
 import supabase from '@/lib/supabaseClient';
 
 const gbp = new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP' });
+
+/* --- Helpers --- */
+function withTimeout<T>(promiseLike: PromiseLike<T>, ms: number, message = 'Request timed out'): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+
+  return Promise.race([Promise.resolve(promiseLike), timeoutPromise]).finally(() => {
+    if (timer) clearTimeout(timer);
+  }) as Promise<T>;
+}
+
+function isExternalUrl(url: string) {
+  return /^https?:\/\//i.test(url);
+}
 
 /* --- Types --- */
 type JoinedOrder = {
@@ -62,24 +79,31 @@ export default function SellerSalesPage() {
   const [error, setError] = useState<string | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
 
+  // ✅ prevents old loads overwriting newer results
+  const loadSeq = useRef(0);
+
+  // ✅ track broken images to avoid repeated Next optimizer issues
+  const [brokenImages, setBrokenImages] = useState<Record<string, true>>({});
+
   useEffect(() => {
     let mounted = true;
 
     async function load() {
-      if (!mounted) return;
+      const seq = ++loadSeq.current;
 
       setLoading(true);
       setError(null);
 
       try {
-        // ✅ Use getSession first (instant/local), avoids "stuck after refresh"
-        const { data: sessionRes, error: sessionErr } = await supabase.auth.getSession();
-        if (sessionErr) throw sessionErr;
+        // 0) session (timeout prevents infinite "Loading…")
+        const sessionRes = await withTimeout(supabase.auth.getSession(), 8000, 'Session lookup timed out');
+        if (!mounted || seq !== loadSeq.current) return;
 
-        const uid = sessionRes.session?.user?.id ?? null;
+        if (sessionRes.error) throw sessionRes.error;
+
+        const uid = sessionRes.data.session?.user?.id ?? null;
 
         if (!uid) {
-          // Not signed in (or session not ready yet)
           setUserId(null);
           setItems([]);
           setError('Please sign in first.');
@@ -89,120 +113,141 @@ export default function SellerSalesPage() {
         setUserId(uid);
 
         // 1) Try joined query first
-        const { data: joined, error: joinErr } = await supabase
-          .from('order_items')
-          .select(
-            `
-            id,
-            created_at,
-            order_id,
-            seller_id,
-            product_slug,
-            title,
-            qty,
-            price_cents,
-            image_url,
-            orders:orders!inner(
-              id,
-              created_at,
-              amount_cents,
-              first_name,
-              last_name,
-              phone,
-              address_line1,
-              address_line2,
-              city,
-              state,
-              postal_code,
-              country
-            )
-          `
-          )
-          .eq('seller_id', uid)
-          .order('created_at', { ascending: false });
-
-        if (!joinErr && Array.isArray(joined)) {
-          setItems(joined as unknown as ItemRow[]);
-          return;
-        }
-
-        // 2) Fallback if join blocked by RLS
-        console.warn('Join failed/blocked; fallback. Details:', joinErr);
-
-        const { data: plainItems, error: itemsErr } = await supabase
-          .from('order_items')
-          .select(
-            `
-            id,
-            created_at,
-            order_id,
-            seller_id,
-            product_slug,
-            title,
-            qty,
-            price_cents,
-            image_url
-          `
-          )
-          .eq('seller_id', uid)
-          .order('created_at', { ascending: false });
-
-        if (itemsErr) throw itemsErr;
-
-        const orderIds = Array.from(new Set((plainItems ?? []).map((i) => i.order_id)));
-        let ordersById = new Map<string, JoinedOrder>();
-
-        if (orderIds.length) {
-          const { data: ordersData, error: ordersErr } = await supabase
-            .from('orders')
+        const joinedRes = await withTimeout(
+          supabase
+            .from('order_items')
             .select(
               `
               id,
               created_at,
-              amount_cents,
-              first_name,
-              last_name,
-              phone,
-              address_line1,
-              address_line2,
-              city,
-              state,
-              postal_code,
-              country
+              order_id,
+              seller_id,
+              product_slug,
+              title,
+              qty,
+              price_cents,
+              image_url,
+              orders:orders!inner(
+                id,
+                created_at,
+                amount_cents,
+                first_name,
+                last_name,
+                phone,
+                address_line1,
+                address_line2,
+                city,
+                state,
+                postal_code,
+                country
+              )
             `
             )
-            .in('id', orderIds);
+            .eq('seller_id', uid)
+            .order('created_at', { ascending: false }),
+          12000,
+          'Sales query timed out'
+        );
 
-          if (!ordersErr && ordersData) {
-            ordersById = new Map(ordersData.map((o) => [o.id, o as JoinedOrder]));
+        if (!mounted || seq !== loadSeq.current) return;
+
+        if (!joinedRes.error && Array.isArray(joinedRes.data)) {
+          setItems(joinedRes.data as unknown as ItemRow[]);
+          return;
+        }
+
+        // 2) Fallback if join blocked by RLS
+        console.warn('Join failed/blocked; fallback. Details:', joinedRes.error);
+
+        const plainRes = await withTimeout(
+          supabase
+            .from('order_items')
+            .select(
+              `
+              id,
+              created_at,
+              order_id,
+              seller_id,
+              product_slug,
+              title,
+              qty,
+              price_cents,
+              image_url
+            `
+            )
+            .eq('seller_id', uid)
+            .order('created_at', { ascending: false }),
+          12000,
+          'Order items query timed out'
+        );
+
+        if (!mounted || seq !== loadSeq.current) return;
+        if (plainRes.error) throw plainRes.error;
+
+        const plainItems = (plainRes.data ?? []) as any[];
+
+        const orderIds = Array.from(new Set(plainItems.map((i) => i.order_id)));
+        let ordersById = new Map<string, JoinedOrder>();
+
+        if (orderIds.length) {
+          const ordersRes = await withTimeout(
+            supabase
+              .from('orders')
+              .select(
+                `
+                id,
+                created_at,
+                amount_cents,
+                first_name,
+                last_name,
+                phone,
+                address_line1,
+                address_line2,
+                city,
+                state,
+                postal_code,
+                country
+              `
+              )
+              .in('id', orderIds),
+            12000,
+            'Orders lookup timed out'
+          );
+
+          if (!mounted || seq !== loadSeq.current) return;
+
+          if (!ordersRes.error && ordersRes.data) {
+            ordersById = new Map((ordersRes.data as any[]).map((o) => [o.id, o as JoinedOrder]));
           } else {
-            console.warn('Orders fetch blocked/failed; showing items without shipping info.', ordersErr);
+            console.warn('Orders fetch blocked/failed; showing items without shipping info.', ordersRes.error);
           }
         }
 
-        const stitched = (plainItems ?? []).map((it) => ({
+        const stitched = plainItems.map((it) => ({
           ...it,
           orders: ordersById.get(it.order_id),
         })) as ItemRow[];
 
         setItems(stitched);
       } catch (e: any) {
+        if (!mounted) return;
         console.error('Seller sales load error:', e);
+        setItems([]);
         setError(e?.message ?? 'Failed to load sales.');
       } finally {
-        if (mounted) setLoading(false);
+        if (mounted && loadSeq.current === loadSeq.current) setLoading(false);
       }
     }
 
     // Initial load
     load();
 
-    // ✅ Re-run load whenever auth session changes (fixes "new tab works" issue)
+    // Re-run when auth session changes
     const { data: sub } = supabase.auth.onAuthStateChange(() => {
       load();
     });
 
-    // ✅ Re-run when tab becomes visible (helps after Stripe redirects / refresh)
+    // Re-run when tab becomes visible
     const onVis = () => {
       if (document.visibilityState === 'visible') load();
     };
@@ -284,29 +329,41 @@ export default function SellerSalesPage() {
                 </div>
 
                 <ul className="divide-y">
-                  {itemsInOrder.map((it) => (
-                    <li key={it.id} className="flex items-center gap-4 px-4 py-3">
-                      <div className="relative h-14 w-14 overflow-hidden rounded bg-gray-100">
-                        {it.image_url ? (
-                          <Image src={it.image_url} alt={it.title} fill className="object-cover" />
-                        ) : (
-                          <div className="grid h-full w-full place-items-center text-xs text-gray-400">No image</div>
-                        )}
-                      </div>
+                  {itemsInOrder.map((it) => {
+                    const imgKey = `${it.id}:${it.image_url ?? ''}`;
+                    const imgBroken = !!brokenImages[imgKey];
 
-                      <div className="min-w-0 flex-1">
-                        <div className="truncate font-medium">{it.title}</div>
-                        <div className="text-sm text-gray-600">
-                          Qty: {it.qty} · Unit: {gbp.format((it.price_cents ?? 0) / 100)}
+                    return (
+                      <li key={it.id} className="flex items-center gap-4 px-4 py-3">
+                        <div className="relative h-14 w-14 overflow-hidden rounded bg-gray-100">
+                          {it.image_url && !imgBroken ? (
+                            <Image
+                              src={it.image_url}
+                              alt={it.title}
+                              fill
+                              className="object-cover"
+                              unoptimized={isExternalUrl(it.image_url)}
+                              onError={() => setBrokenImages((p) => ({ ...p, [imgKey]: true }))}
+                            />
+                          ) : (
+                            <div className="grid h-full w-full place-items-center text-xs text-gray-400">No image</div>
+                          )}
                         </div>
-                        {it.product_slug && <div className="text-xs text-gray-500">slug: {it.product_slug}</div>}
-                      </div>
 
-                      <div className="whitespace-nowrap font-semibold">
-                        {gbp.format(((it.qty ?? 0) * (it.price_cents ?? 0)) / 100)}
-                      </div>
-                    </li>
-                  ))}
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate font-medium">{it.title}</div>
+                          <div className="text-sm text-gray-600">
+                            Qty: {it.qty} · Unit: {gbp.format((it.price_cents ?? 0) / 100)}
+                          </div>
+                          {it.product_slug && <div className="text-xs text-gray-500">slug: {it.product_slug}</div>}
+                        </div>
+
+                        <div className="whitespace-nowrap font-semibold">
+                          {gbp.format(((it.qty ?? 0) * (it.price_cents ?? 0)) / 100)}
+                        </div>
+                      </li>
+                    );
+                  })}
                 </ul>
               </li>
             );
@@ -321,30 +378,42 @@ export default function SellerSalesPage() {
           </p>
 
           <ul className="divide-y rounded-xl border bg-white">
-            {items.map((it) => (
-              <li key={it.id} className="flex items-center gap-4 px-4 py-3">
-                <div className="relative h-14 w-14 overflow-hidden rounded bg-gray-100">
-                  {it.image_url ? (
-                    <Image src={it.image_url} alt={it.title} fill className="object-cover" />
-                  ) : (
-                    <div className="grid h-full w-full place-items-center text-xs text-gray-400">No image</div>
-                  )}
-                </div>
+            {items.map((it) => {
+              const imgKey = `${it.id}:${it.image_url ?? ''}`;
+              const imgBroken = !!brokenImages[imgKey];
 
-                <div className="min-w-0 flex-1">
-                  <div className="truncate font-medium">{it.title}</div>
-                  <div className="text-sm text-gray-600">
-                    Qty: {it.qty} · Unit: {gbp.format((it.price_cents ?? 0) / 100)}
+              return (
+                <li key={it.id} className="flex items-center gap-4 px-4 py-3">
+                  <div className="relative h-14 w-14 overflow-hidden rounded bg-gray-100">
+                    {it.image_url && !imgBroken ? (
+                      <Image
+                        src={it.image_url}
+                        alt={it.title}
+                        fill
+                        className="object-cover"
+                        unoptimized={isExternalUrl(it.image_url)}
+                        onError={() => setBrokenImages((p) => ({ ...p, [imgKey]: true }))}
+                      />
+                    ) : (
+                      <div className="grid h-full w-full place-items-center text-xs text-gray-400">No image</div>
+                    )}
                   </div>
-                  {it.product_slug && <div className="text-xs text-gray-500">slug: {it.product_slug}</div>}
-                </div>
 
-                <div className="text-right">
-                  <div className="text-xs text-gray-500">Order {it.order_id.slice(0, 8)}…</div>
-                  <div className="font-semibold">{gbp.format(((it.qty ?? 0) * (it.price_cents ?? 0)) / 100)}</div>
-                </div>
-              </li>
-            ))}
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate font-medium">{it.title}</div>
+                    <div className="text-sm text-gray-600">
+                      Qty: {it.qty} · Unit: {gbp.format((it.price_cents ?? 0) / 100)}
+                    </div>
+                    {it.product_slug && <div className="text-xs text-gray-500">slug: {it.product_slug}</div>}
+                  </div>
+
+                  <div className="text-right">
+                    <div className="text-xs text-gray-500">Order {it.order_id.slice(0, 8)}…</div>
+                    <div className="font-semibold">{gbp.format(((it.qty ?? 0) * (it.price_cents ?? 0)) / 100)}</div>
+                  </div>
+                </li>
+              );
+            })}
           </ul>
         </>
       )}
