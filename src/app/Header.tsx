@@ -3,11 +3,55 @@
 
 import Link from 'next/link';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
-import { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import supabase from '@/lib/supabaseClient';
 import { useCart } from '@/lib/CartProvider';
 
 type SellerStatus = 'approved' | 'pending' | 'rejected' | null;
+
+function withTimeout<T>(promiseLike: PromiseLike<T>, ms: number, message = 'Request timed out'): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+
+  return Promise.race([Promise.resolve(promiseLike), timeoutPromise]).finally(() => {
+    if (timer) clearTimeout(timer);
+  }) as Promise<T>;
+}
+
+function getStoredTokens(): { access_token: string; refresh_token: string } | null {
+  try {
+    const key = Object.keys(localStorage).find((k) => k.includes('auth-token'));
+    if (!key) return null;
+
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+
+    const parsed = JSON.parse(raw);
+
+    const access_token =
+      parsed?.access_token ?? parsed?.currentSession?.access_token ?? parsed?.session?.access_token;
+    const refresh_token =
+      parsed?.refresh_token ?? parsed?.currentSession?.refresh_token ?? parsed?.session?.refresh_token;
+
+    if (!access_token || !refresh_token) return null;
+    return { access_token, refresh_token };
+  } catch {
+    return null;
+  }
+}
+
+async function forceRestoreSession() {
+  const tokens = getStoredTokens();
+  if (!tokens) return;
+  try {
+    await withTimeout(supabase.auth.setSession(tokens), 8000, 'Session rehydrate timed out');
+  } catch {
+    // ignore
+  }
+}
 
 export default function Header() {
   const { count } = useCart();
@@ -25,21 +69,18 @@ export default function Header() {
   const [menuOpen, setMenuOpen] = useState(false);
 
   function computeInitial(email: string | null, user: any) {
-    const fullName =
-      (user?.user_metadata as any)?.full_name ||
-      (user?.user_metadata as any)?.name ||
-      '';
+    const fullName = user?.user_metadata?.full_name || user?.user_metadata?.name || '';
     const src = (fullName || email || '').trim();
     return src ? src.charAt(0).toUpperCase() : 'U';
   }
 
   async function loadSellerStatus(uid: string) {
     try {
-      const { data, error } = await supabase
-        .from('sellers')
-        .select('status')
-        .eq('id', uid) // sellers.id = auth.uid()
-        .maybeSingle();
+      const { data, error } = await withTimeout(
+        supabase.from('sellers').select('status').eq('id', uid).maybeSingle(),
+        8000,
+        'Seller status timed out'
+      );
 
       if (error) return null;
       return (data?.status as SellerStatus) ?? null;
@@ -48,27 +89,40 @@ export default function Header() {
     }
   }
 
-  // --- Auth & seller status (robust, works after Stripe redirect) ---
+  // --- Auth & seller status (robust) ---
   useEffect(() => {
     let mounted = true;
 
     async function init() {
-      const { data } = await supabase.auth.getSession();
-      if (!mounted) return;
+      try {
+        // ✅ Fix for prod: force restore before reading session
+        await forceRestoreSession();
 
-      const session = data.session ?? null;
-      const email = session?.user?.email ?? null;
-
-      setUserEmail(email);
-      setInitial(computeInitial(email, session?.user));
-      setAuthReady(true);
-
-      if (session?.user?.id) {
-        const status = await loadSellerStatus(session.user.id);
+        const { data, error } = await withTimeout(supabase.auth.getSession(), 8000, 'Session lookup timed out');
         if (!mounted) return;
-        setSellerStatus(status);
-      } else {
+
+        if (error) throw error;
+
+        const session = data.session ?? null;
+        const email = session?.user?.email ?? null;
+
+        setUserEmail(email);
+        setInitial(computeInitial(email, session?.user));
+        setAuthReady(true);
+
+        if (session?.user?.id) {
+          const status = await loadSellerStatus(session.user.id);
+          if (!mounted) return;
+          setSellerStatus(status);
+        } else {
+          setSellerStatus(null);
+        }
+      } catch {
+        if (!mounted) return;
+        setUserEmail(null);
+        setInitial('U');
         setSellerStatus(null);
+        setAuthReady(true);
       }
     }
 
@@ -126,7 +180,6 @@ export default function Header() {
   async function signOut() {
     await supabase.auth.signOut();
     setMenuOpen(false);
-    // Router refresh is enough; auth listener will also update state
     router.refresh();
   }
 
@@ -161,10 +214,7 @@ export default function Header() {
               className="w-full bg-transparent outline-none"
               defaultValue={searchParams?.get('q') ?? ''}
             />
-            <button
-              type="submit"
-              className="rounded-full bg-blue-600 px-4 py-1.5 text-white hover:bg-blue-500"
-            >
+            <button type="submit" className="rounded-full bg-blue-600 px-4 py-1.5 text-white hover:bg-blue-500">
               Search
             </button>
           </div>
@@ -172,10 +222,8 @@ export default function Header() {
 
         {/* Auth / Profile */}
         {!authReady ? null : !userEmail ? (
-          <Link
-            href="/signin"
-            className="hidden sm:inline-flex rounded-full border px-3 py-2 text-sm hover:bg-gray-50"
-          >
+          // ✅ SHOW ON ALL SCREEN SIZES (removed "hidden sm:inline-flex")
+          <Link href="/signin" className="inline-flex rounded-full border px-3 py-2 text-sm hover:bg-gray-50">
             Sign in / Sign up
           </Link>
         ) : (
@@ -189,20 +237,13 @@ export default function Header() {
               <span className="flex h-8 w-8 items-center justify-center rounded-full bg-gray-900 text-sm font-semibold text-white">
                 {initial}
               </span>
-              <svg
-                className="h-4 w-4 text-gray-600 hidden sm:block"
-                viewBox="0 0 20 20"
-                fill="currentColor"
-              >
+              <svg className="h-4 w-4 text-gray-600 hidden sm:block" viewBox="0 0 20 20" fill="currentColor">
                 <path d="M5.23 7.21a.75.75 0 011.06.02L10 10.94l3.71-3.71a.75.75 0 111.06 1.06l-4.24 4.24a.75.75 0 01-1.06 0L5.21 8.29a.75.75 0 01.02-1.08z" />
               </svg>
             </button>
 
             {menuOpen && (
-              <div
-                role="menu"
-                className="absolute right-0 mt-2 w-56 rounded-lg border bg-white p-2 shadow-xl"
-              >
+              <div role="menu" className="absolute right-0 mt-2 w-56 rounded-lg border bg-white p-2 shadow-xl">
                 <Link
                   href="/account"
                   onClick={() => setMenuOpen(false)}
