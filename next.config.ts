@@ -4,21 +4,60 @@ import type { NextConfig } from 'next';
 const nextConfig: NextConfig = {
   images: {
     remotePatterns: [
-      // your Supabase public bucket
+      // Supabase public bucket
       {
         protocol: 'https',
         hostname: 'nzbtgoqdcugqviiichbg.supabase.co',
+        pathname: '/**',
       },
-      // Google thumbnails (if you show them)
-      { protocol: 'https', hostname: 'encrypted-tbn0.gstatic.com' },
-      // Apple newsroom / product images
-      { protocol: 'https', hostname: 'www.apple.com' },
-      { protocol: 'https', hostname: 'store.storeimages.cdn-apple.com' },
-      // (optional) common hosts you’ve used
-      { protocol: 'https', hostname: 'images.unsplash.com' },
-      { protocol: 'https', hostname: 'm.media-amazon.com' },
-      { protocol: 'https', hostname: 'i.imgur.com' },
-      { protocol: 'https', hostname: 'lh3.googleusercontent.com' },
+
+      // Google thumbnails
+      {
+        protocol: 'https',
+        hostname: 'encrypted-tbn0.gstatic.com',
+        pathname: '/**',
+      },
+
+      // Apple images
+      {
+        protocol: 'https',
+        hostname: 'www.apple.com',
+        pathname: '/**',
+      },
+      {
+        protocol: 'https',
+        hostname: 'store.storeimages.cdn-apple.com',
+        pathname: '/**',
+      },
+
+      // External product images
+      {
+        protocol: 'https',
+        hostname: 'images.unsplash.com',
+        pathname: '/**',
+      },
+      {
+        protocol: 'https',
+        hostname: 'm.media-amazon.com',
+        pathname: '/**',
+      },
+      {
+        protocol: 'https',
+        hostname: 'i.imgur.com',
+        pathname: '/**',
+      },
+      {
+        protocol: 'https',
+        hostname: 'lh3.googleusercontent.com',
+        pathname: '/**',
+      },
+
+      // ✅ FIX FOR YOUR ERROR
+      {
+        protocol: 'https',
+        hostname: 'www.ur.co.uk',
+        pathname: '/**',
+      },
     ],
   },
 };
