@@ -21,19 +21,6 @@ type OrderRow = {
   order_items: OrderItem[] | null;
 };
 
-// ✅ Accept PromiseLike because Supabase query builders are "thenable", not typed as Promise<T>
-function withTimeout<T>(promiseLike: PromiseLike<T>, ms: number, message = 'Request timed out'): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | null = null;
-
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(message)), ms);
-  });
-
-  return Promise.race([Promise.resolve(promiseLike), timeoutPromise]).finally(() => {
-    if (timer) clearTimeout(timer);
-  }) as Promise<T>;
-}
-
 function isExternalUrl(url: string) {
   return /^https?:\/\//i.test(url);
 }
@@ -67,29 +54,32 @@ function getStoredTokens(): { access_token: string; refresh_token: string } | nu
 
 /**
  * Production fix: if Supabase gets into a stuck state on refresh,
- * force rehydrate the session from localStorage before calling getSession().
+ * force rehydrate the session from localStorage.
+ *
+ * IMPORTANT: DO NOT wrap this in a hard timeout (it can cause AbortError in prod).
  */
 async function forceRestoreSession() {
   const tokens = getStoredTokens();
   if (!tokens) return;
 
   try {
-    await withTimeout(supabase.auth.setSession(tokens), 8000, 'Session rehydrate timed out');
+    await supabase.auth.setSession(tokens);
   } catch {
-    // ignore; caller will handle if session still can't be read
+    // ignore; we'll handle missing user below
   }
 }
 
 export default function OrdersPage() {
   const [orders, setOrders] = useState<OrderRow[]>([]);
   const [loading, setLoading] = useState(true);
+  const [slow, setSlow] = useState(false); // soft "timeout" indicator
   const [error, setError] = useState<string | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
 
-  // ✅ ensures only latest load can update state
+  // ensures only latest load can update state
   const loadSeq = useRef(0);
 
-  // ✅ track image failures so we stop retrying broken optimizer URLs
+  // track image failures so we stop retrying broken optimizer URLs
   const [brokenImages, setBrokenImages] = useState<Record<string, true>>({});
 
   const gbp = useMemo(
@@ -101,20 +91,25 @@ export default function OrdersPage() {
     const seq = ++loadSeq.current;
 
     setLoading(true);
+    setSlow(false);
     setError(null);
 
+    // Soft "taking longer" indicator after 8s (does NOT abort requests)
+    const slowTimer = window.setTimeout(() => {
+      if (seq === loadSeq.current) setSlow(true);
+    }, 8000);
+
     try {
-      // ✅ IMPORTANT: force restore before getSession (fixes prod refresh timeouts)
+      // ✅ Rehydrate session (helps prod refresh)
       await forceRestoreSession();
-
-      // 1) Session
-      const sessionRes = await withTimeout(supabase.auth.getSession(), 8000, 'Session lookup timed out');
-
       if (seq !== loadSeq.current) return;
 
-      if (sessionRes.error) throw sessionRes.error;
+      // ✅ Use getUser (more reliable for UI than getSession)
+      const { data: userRes, error: userErr } = await supabase.auth.getUser();
+      if (seq !== loadSeq.current) return;
+      if (userErr) throw userErr;
 
-      const user = sessionRes.data.session?.user ?? null;
+      const user = userRes.user ?? null;
       setUserId(user?.id ?? null);
 
       if (!user) {
@@ -123,34 +118,29 @@ export default function OrdersPage() {
         return;
       }
 
-      // 2) Orders query
-      const { data, error } = await withTimeout(
-        supabase
-          .from('orders')
-          .select(
-            `
-              id,
-              user_id,
-              created_at,
-              amount_cents,
-              order_items (
-                product_slug,
-                title,
-                qty,
-                price_cents,
-                image_url
-              )
-            `
-          )
-          .eq('user_id', user.id)
-          .order('created_at', { ascending: false }),
-        12000,
-        'Orders query timed out'
-      );
+      // ✅ Orders query (NO hard timeout -> avoids AbortError)
+      const { data, error: ordersErr } = await supabase
+        .from('orders')
+        .select(
+          `
+            id,
+            user_id,
+            created_at,
+            amount_cents,
+            order_items (
+              product_slug,
+              title,
+              qty,
+              price_cents,
+              image_url
+            )
+          `
+        )
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: false });
 
       if (seq !== loadSeq.current) return;
-
-      if (error) throw error;
+      if (ordersErr) throw ordersErr;
 
       setOrders((data as OrderRow[]) ?? []);
     } catch (err: any) {
@@ -159,6 +149,7 @@ export default function OrdersPage() {
       setOrders([]);
       setError(err?.message || 'Failed to load orders.');
     } finally {
+      window.clearTimeout(slowTimer);
       if (seq === loadSeq.current) setLoading(false);
     }
   }, []);
@@ -173,12 +164,12 @@ export default function OrdersPage() {
 
     safeLoad();
 
-    // ✅ refetch when auth changes
+    // refetch when auth changes
     const { data: sub } = supabase.auth.onAuthStateChange(() => {
       safeLoad();
     });
 
-    // ✅ refetch when tab becomes visible again
+    // refetch when tab becomes visible again
     const onVis = () => {
       if (document.visibilityState === 'visible') safeLoad();
     };
@@ -215,7 +206,16 @@ export default function OrdersPage() {
         </button>
       </div>
 
-      {loading && <p>Loading your orders…</p>}
+      {loading && (
+        <div className="space-y-2">
+          <p>Loading your orders…</p>
+          {slow && (
+            <p className="text-sm text-amber-700">
+              Taking longer than usual… (production cold starts / auth refresh can be slow)
+            </p>
+          )}
+        </div>
+      )}
 
       {error && (
         <div className="rounded-lg border bg-white p-4">
@@ -256,7 +256,7 @@ export default function OrdersPage() {
                           width={60}
                           height={60}
                           className="rounded-md"
-                          // ✅ Avoid Next optimizer 400 for random external URLs
+                          // Avoid Next optimizer 400 for random external URLs
                           unoptimized={isExternalUrl(it.image_url)}
                           onError={() => setBrokenImages((prev) => ({ ...prev, [imgKey]: true }))}
                         />
