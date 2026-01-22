@@ -15,25 +15,33 @@ export default function SellerHub() {
   const [products, setProducts] = useState<Product[]>([]);
 
   // 1) Get session on mount + subscribe to changes
-  useEffect(() => {
-    let mounted = true;
+    useEffect(() => {
+  let mounted = true;
 
-    (async () => {
-      const { data: { session } } = await supabase.auth.getSession();
+  (async () => {
+    try {
+      const { data, error } = await supabase.auth.getSession();
+      if (error) throw error;
       if (!mounted) return;
-      setUserId(session?.user?.id ?? null);
-      setLoading(false);
-    })();
+      setUserId(data.session?.user?.id ?? null);
+    } catch (e) {
+      if (!mounted) return;
+      setUserId(null);
+    } finally {
+      if (mounted) setLoading(false);
+    }
+  })();
 
-    const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => {
-      setUserId(session?.user?.id ?? null);
-    });
+  const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => {
+    setUserId(session?.user?.id ?? null);
+  });
 
-    return () => {
-      mounted = false;
-      sub.subscription.unsubscribe();
-    };
-  }, []);
+  return () => {
+    mounted = false;
+    sub.subscription.unsubscribe();
+  };
+}, []);
+
 
   // 2) When we have a user id, fetch seller status and listings
   useEffect(() => {

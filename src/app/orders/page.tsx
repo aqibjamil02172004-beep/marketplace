@@ -37,17 +37,18 @@ export default function OrdersPage() {
     setError(null);
 
     try {
-      const { data: u, error: uErr } = await supabase.auth.getUser();
-      if (uErr) throw uErr;
+       const { data: sessionRes, error: sessionErr } = await supabase.auth.getSession();
+if (sessionErr) throw sessionErr;
 
-      const user = u?.user ?? null;
-      setUserId(user?.id ?? null);
+const user = sessionRes.session?.user ?? null;
+setUserId(user?.id ?? null);
 
-      if (!user) {
-        setOrders([]);
-        setError('Please sign in to view your orders.');
-        return;
-      }
+if (!user) {
+  setOrders([]);
+  setError('Please sign in to view your orders.');
+  return;
+}
+
 
       const { data, error } = await supabase
         .from('orders')

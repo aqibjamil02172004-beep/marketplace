@@ -4,8 +4,6 @@ import { useEffect, useMemo, useState } from 'react';
 import Image from 'next/image';
 import supabase from '@/lib/supabaseClient';
 
-
-
 const gbp = new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP' });
 
 /* --- Types --- */
@@ -26,7 +24,7 @@ type JoinedOrder = {
 
 type ItemRow = {
   id: string;
-  created_at: string; // order_items.created_at
+  created_at: string;
   order_id: string;
   seller_id: string | null;
   product_slug: string | null;
@@ -34,7 +32,7 @@ type ItemRow = {
   qty: number;
   price_cents: number;
   image_url: string | null;
-  orders?: JoinedOrder; // join result
+  orders?: JoinedOrder;
 };
 
 type OrderGroup = {
@@ -62,7 +60,6 @@ export default function SellerSalesPage() {
   const [items, setItems] = useState<ItemRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-
   const [userId, setUserId] = useState<string | null>(null);
 
   useEffect(() => {
@@ -74,34 +71,24 @@ export default function SellerSalesPage() {
       setLoading(true);
       setError(null);
 
-      // Safety timeout so the UI never stays stuck forever
-      const timeout = setTimeout(() => {
-        if (!mounted) return;
-        setLoading(false);
-        setError('Timed out loading sales. Please refresh.');
-      }, 12000);
-
       try {
-        // 1) Wait for session to be ready
-        // (getSession is often more reliable immediately after refresh)
-        const { data: sRes, error: sErr } = await supabase.auth.getSession();
-        if (sErr) throw sErr;
+        // ✅ Use getSession first (instant/local), avoids "stuck after refresh"
+        const { data: sessionRes, error: sessionErr } = await supabase.auth.getSession();
+        if (sessionErr) throw sessionErr;
 
-        const uid = sRes?.session?.user?.id ?? null;
+        const uid = sessionRes.session?.user?.id ?? null;
 
         if (!uid) {
-          // Not signed in (or session not restored yet)
-          // Don’t throw — just show friendly message.
+          // Not signed in (or session not ready yet)
           setUserId(null);
           setItems([]);
-          setLoading(false);
-          setError('Please sign in to view seller sales.');
+          setError('Please sign in first.');
           return;
         }
 
         setUserId(uid);
 
-        // 2) Try JOIN query (best UX)
+        // 1) Try joined query first
         const { data: joined, error: joinErr } = await supabase
           .from('order_items')
           .select(
@@ -134,16 +121,13 @@ export default function SellerSalesPage() {
           .eq('seller_id', uid)
           .order('created_at', { ascending: false });
 
-        if (!mounted) return;
-
         if (!joinErr && Array.isArray(joined)) {
           setItems(joined as unknown as ItemRow[]);
-          setLoading(false);
           return;
         }
 
-        // 3) Fallback path (if orders join blocked by RLS)
-        console.warn('Join blocked/failed; fallback path. Details:', joinErr?.message);
+        // 2) Fallback if join blocked by RLS
+        console.warn('Join failed/blocked; fallback. Details:', joinErr);
 
         const { data: plainItems, error: itemsErr } = await supabase
           .from('order_items')
@@ -165,7 +149,6 @@ export default function SellerSalesPage() {
 
         if (itemsErr) throw itemsErr;
 
-        // Try to fetch orders (may still be blocked by RLS for sellers)
         const orderIds = Array.from(new Set((plainItems ?? []).map((i) => i.order_id)));
         let ordersById = new Map<string, JoinedOrder>();
 
@@ -193,7 +176,7 @@ export default function SellerSalesPage() {
           if (!ordersErr && ordersData) {
             ordersById = new Map(ordersData.map((o) => [o.id, o as JoinedOrder]));
           } else {
-            console.warn('Orders fetch blocked by RLS; items only. Details:', ordersErr?.message);
+            console.warn('Orders fetch blocked/failed; showing items without shipping info.', ordersErr);
           }
         }
 
@@ -203,28 +186,32 @@ export default function SellerSalesPage() {
         })) as ItemRow[];
 
         setItems(stitched);
-        setLoading(false);
       } catch (e: any) {
         console.error('Seller sales load error:', e);
-        if (!mounted) return;
-        setLoading(false);
         setError(e?.message ?? 'Failed to load sales.');
       } finally {
-        clearTimeout(timeout);
+        if (mounted) setLoading(false);
       }
     }
 
     // Initial load
     load();
 
-    // ✅ Key fix: re-run load when auth changes (after refresh / token restore)
+    // ✅ Re-run load whenever auth session changes (fixes "new tab works" issue)
     const { data: sub } = supabase.auth.onAuthStateChange(() => {
       load();
     });
 
+    // ✅ Re-run when tab becomes visible (helps after Stripe redirects / refresh)
+    const onVis = () => {
+      if (document.visibilityState === 'visible') load();
+    };
+    document.addEventListener('visibilitychange', onVis);
+
     return () => {
       mounted = false;
       sub.subscription.unsubscribe();
+      document.removeEventListener('visibilitychange', onVis);
     };
   }, []);
 
@@ -234,8 +221,8 @@ export default function SellerSalesPage() {
     for (const it of items) {
       if (!it.orders) continue;
       const key = it.order_id;
-      const exist = map.get(key);
-      if (exist) exist.items.push(it);
+      const existing = map.get(key);
+      if (existing) existing.items.push(it);
       else map.set(key, { order: it.orders, items: [it] });
     }
 
@@ -264,7 +251,7 @@ export default function SellerSalesPage() {
             const ship = formatShipTo(order);
 
             return (
-              <li key={order.id} className="overflow-hidden rounded-xl border">
+              <li key={order.id} className="overflow-hidden rounded-xl border bg-white">
                 <header className="flex items-center justify-between border-b px-4 py-3 text-sm text-gray-600">
                   <div>
                     Order <code>{order.id.slice(0, 8)}…</code>
@@ -275,6 +262,7 @@ export default function SellerSalesPage() {
                 <div className="grid gap-3 border-b px-4 py-3 sm:grid-cols-2">
                   <div>
                     <div className="font-semibold">Ship to</div>
+
                     <div className="text-sm text-gray-800">{ship.fullName}</div>
 
                     {ship.phone && (
@@ -285,7 +273,7 @@ export default function SellerSalesPage() {
                     )}
 
                     <div className="mt-1 text-sm text-gray-600">
-                      {ship.lines.length ? ship.lines.map((l, i) => <div key={i}>{l}</div>) : <div>—</div>}
+                      {ship.lines.length ? ship.lines.map((line, idx) => <div key={idx}>{line}</div>) : <div>—</div>}
                     </div>
                   </div>
 
@@ -332,7 +320,7 @@ export default function SellerSalesPage() {
             Some order details are hidden by security policies. Showing item list only.
           </p>
 
-          <ul className="divide-y rounded-xl border">
+          <ul className="divide-y rounded-xl border bg-white">
             {items.map((it) => (
               <li key={it.id} className="flex items-center gap-4 px-4 py-3">
                 <div className="relative h-14 w-14 overflow-hidden rounded bg-gray-100">
